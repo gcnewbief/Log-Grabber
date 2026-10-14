@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller artifacts (rebuild via build.cmd)
+build/
+dist/
+
+# Collector output - contains customer data, hives (SAM/SECURITY), dumps
+cases/
+test_run/
+test_out/
+*.zip
+*.evtx
+*.dmp
+*.pdf
+!reference/*.pdf
+
+# Secrets
+.env

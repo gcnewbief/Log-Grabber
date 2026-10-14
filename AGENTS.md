@@ -92,3 +92,14 @@ Repo: github.com/gcnewbief/Log-Grabber · releases carry `LogGrabber.exe`.
 Version lives in `log_grabber.py __version__`; bump on behavior changes and
 re-tag (`v1.0.0` = initial release, `1.0.1` = storport internal/external
 split).
+
+## Future work (next update)
+
+- **Refine storport USB/external reporting**: break external stalls down
+  further (per-device table, event ID split 549 vs 557, first/last seen).
+  Rationale from the shop: many stalls on one USB device usually means a
+  dodgy stick/enclosure, not a machine fault — the report should say which
+  specific external device is implicated so it can be discounted or
+  blamed. Internal drives remain the main focus.
+- Reconcile the automated PDF with technician review (report is a baseline;
+  AI/tech write-up decides the verdict).

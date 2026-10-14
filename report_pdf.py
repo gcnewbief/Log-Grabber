@@ -86,6 +86,36 @@ def _count(diag, key):
     return int((diag.get("counts") or {}).get(key) or 0)
 
 
+# Storport miniports that are external/virtual - stalls on these are mostly
+# USB bridge or power-management noise, not drive-failure evidence.
+EXTERNAL_MINIPORTS = ("uaspstor", "usbstor", "usbccid", "sdstor", "vhdmp", "vsmpp")
+USB_BUS_TYPES = {"7", "18"}  # 7=USB, 18=SD
+
+
+def _storport_breakdown(diag):
+    """Split sampled storport 549/557 events into (internal, external) device
+    counters. BootDevice=true always counts as internal regardless of bus."""
+    internal, external = {}, {}
+    samples = ((diag.get("events") or {}).get("storport") or {}).get("samples") or []
+    for s in samples:
+        dd = s.get("data") or {}
+        mp = (dd.get("MiniportName") or "").strip().lower()
+        prod = (dd.get("ProductId") or dd.get("VendorId") or "").strip() or mp or "unknown"
+        boot = (dd.get("BootDevice") or "").strip().lower() == "true"
+        is_external = (not boot) and (
+            mp in EXTERNAL_MINIPORTS or (dd.get("BusType") or "").strip() in USB_BUS_TYPES
+        )
+        (external if is_external else internal)[prod] = \
+            (external if is_external else internal).get(prod, 0) + 1
+    truncated = bool(((diag.get("events") or {}).get("storport") or {}).get("truncated"))
+    return internal, external, truncated
+
+
+def _top_devices(counter, limit=3):
+    return ", ".join(f"{n} ({c})" for n, c in
+                     sorted(counter.items(), key=lambda kv: -kv[1])[:limit]) or "none"
+
+
 def _bugcheck_summary(diag):
     """Group Event 41 samples by bugcheck name -> (count, hex)."""
     out = {}
@@ -120,21 +150,32 @@ def build_findings(diag):
             if sku.lower() in friendly.lower():
                 bad_disk_names.append((friendly, note))
 
-    # 1. Storage pattern - strongest shop signal.
-    store_culprit = bad_disk_names[0][0] if bad_disk_names else None
-    if stor or (volmgr and kp41) or bad_disk_names:
+    # 1. Storage pattern - strongest shop signal. Storport stalls are split by
+    # device: USB/UASP/external stalls are bridge/power noise, only internal
+    # (or BootDevice-flagged) stalls count toward a boot-drive verdict.
+    internal_sp, external_sp, _sp_trunc = _storport_breakdown(diag)
+    stor_internal = sum(internal_sp.values())
+    stor_external = sum(external_sp.values())
+    top_internal = sorted(internal_sp.items(), key=lambda kv: -kv[1])
+    store_culprit = bad_disk_names[0][0] if bad_disk_names else (top_internal[0][0] if top_internal else None)
+    if stor_internal or (volmgr and kp41) or bad_disk_names:
         bits = []
-        if stor:
-            bits.append(f"{stor} Storport 549/557 I/O stalls")
+        if stor_internal:
+            bits.append(f"{stor_internal} Storport 549/557 stalls on internal devices "
+                        f"({_top_devices(internal_sp)})")
         if volmgr:
             bits.append(f"{volmgr} volmgr 161 dump-write failures")
         if "UNEXPECTED_STORE_EXCEPTION" in bad_checks or "CRITICAL_PROCESS_DIED" in bad_checks:
             bits.append("storage-class bugchecks")
-        tone = "red" if (stor >= 3 or volmgr or bad_disk_names) else "orange"
+        tone = "red" if (stor_internal >= 3 or volmgr or bad_disk_names) else "orange"
         detail = "; ".join(bits) or "storage suspect"
         if store_culprit:
             detail += f". Suspect device: {store_culprit}"
         findings.append((tone, "Boot storage failing", detail + ". Replace the drive, do not just reinstall Windows."))
+    if stor_external and not stor_internal:
+        findings.append(("green", f"Storport stalls on USB/external devices only (x{stor_external})",
+                         f"Devices: {_top_devices(external_sp)}. USB/UASP bridge or power-management "
+                         "noise - not evidence of a failing boot drive."))
 
     if bad_disk_names:
         for name, note in bad_disk_names:
@@ -214,9 +255,14 @@ def build_indicators(diag):
     rows.append(("Disk errors (7/11/51/153)", _count(diag, "disk_7_11_51_153"),
                  "controller/cable/drive errors", "orange" if _count(diag, "disk_7_11_51_153") else "green"))
     stor = _count(diag, "storport_549_557")
-    rows.append(("Storport 549/557 I/O stalls", stor,
-                 ">30s I/O on boot disk beats SMART Healthy - suspect SSD/NVMe",
-                 "red" if stor >= 3 else "orange" if stor else "green"))
+    internal_sp, external_sp, _t = _storport_breakdown(diag)
+    stor_internal = sum(internal_sp.values())
+    stor_external = sum(external_sp.values())
+    sp_note = (f"internal: {_top_devices(internal_sp, 2)}"
+               + (f"; external/USB: {_top_devices(external_sp, 2)}" if stor_external else "")
+               if stor else ">30s I/O on boot disk beats SMART Healthy - suspect SSD/NVMe")
+    rows.append(("Storport 549/557 I/O stalls", stor, sp_note,
+                 "red" if stor_internal >= 3 else "orange" if stor else "green"))
     rows.append(("WHEA hardware errors", _count(diag, "whea_errors"),
                  "PCIe/RAM/CPU hardware fault", "red" if _count(diag, "whea_errors") else "green"))
     rows.append(("Code Integrity errors", _count(diag, "code_integrity"),

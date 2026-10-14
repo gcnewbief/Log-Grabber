@@ -28,7 +28,7 @@ from tkinter import ttk, messagebox
 import evtx_to_md
 import report_pdf
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 TITLE = f"Log Grabber v{__version__}"
 NAVY = "#102a43"
 NAVY_MID = "#243b53"

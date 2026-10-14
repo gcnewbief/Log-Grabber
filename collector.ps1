@@ -256,7 +256,8 @@ if ($isLive) {
     foreach ($chan in $wantedChannels) {
         $safeName = ($chan -replace '/', '%4') + '.evtx'
         $dst = Join-Path $evtxDir $safeName
-        $wevOut = & wevtutil.exe epl "$chan" "$dst" /ow:true 2>&1
+        try { $wevOut = & wevtutil.exe epl "$chan" "$dst" /ow:true 2>&1 }
+        catch { $wevOut = $_.Exception.Message }
         if (Test-Path $dst) { Out-Log "exported $chan" }
         else { Out-Log "missing $chan :: $(Truncate ([string]$wevOut) 120)" }
         Pump-Ui
@@ -293,58 +294,72 @@ if ($isLive) {
 Set-Progress 3 'Copying WER reports'
 $werSrc = Join-Path $win 'ProgramData\Microsoft\Windows\WER\ReportArchive'
 if (Test-Path $werSrc) {
-    robocopy $werSrc (Join-Path $OutDir 'wer') /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
-    Out-Log 'copied WER ReportArchive'
+    try { robocopy $werSrc (Join-Path $OutDir 'wer') /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
+          Out-Log 'copied WER ReportArchive' }
+    catch { Out-Log "FAIL WER ReportArchive :: $($_.Exception.Message)" }
 }
 $werSrc2 = Join-Path $win 'ProgramData\Microsoft\Windows\WER\ReportQueue'
 if (Test-Path $werSrc2) {
-    robocopy $werSrc2 (Join-Path $OutDir 'wer_queue') /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
-    Out-Log 'copied WER ReportQueue'
+    try { robocopy $werSrc2 (Join-Path $OutDir 'wer_queue') /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
+          Out-Log 'copied WER ReportQueue' }
+    catch { Out-Log "FAIL WER ReportQueue :: $($_.Exception.Message)" }
 }
 
 Set-Progress 4 'Reading hardware (CPU, RAM, disks, GPU)'
-$cs = Get-CimInstance Win32_ComputerSystem
-$bios = Get-CimInstance Win32_BIOS
-$osLive = Get-CimInstance Win32_OperatingSystem
-$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
-$ramMods = @(Get-CimInstance Win32_PhysicalMemory | ForEach-Object {
-    [ordered]@{
-        bank         = [string]$_.BankLabel
-        manufacturer = [string]$_.Manufacturer.Trim()
-        part         = [string]$_.PartNumber.Trim()
-        serial       = [string]$_.SerialNumber
-        bytes        = [int64]$_.Capacity
-        speed_mhz    = [int]$_.Speed
-    }
-})
+# Every WMI/CIM query is optional - a broken machine may have a broken WMI.
+try { $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop }
+catch { $cs = $null; Out-Log "WMI ComputerSystem failed: $($_.Exception.Message)" }
+try { $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop }
+catch { $bios = $null; Out-Log "WMI BIOS failed: $($_.Exception.Message)" }
+try { $osLive = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop }
+catch { $osLive = $null; Out-Log "WMI OperatingSystem failed: $($_.Exception.Message)" }
+try { $cpu = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1 }
+catch { $cpu = $null; Out-Log "WMI Processor failed: $($_.Exception.Message)" }
+try {
+    $ramMods = @(Get-CimInstance Win32_PhysicalMemory -ErrorAction Stop | ForEach-Object {
+        [ordered]@{
+            bank         = [string]$_.BankLabel
+            manufacturer = [string]$_.Manufacturer.Trim()
+            part         = [string]$_.PartNumber.Trim()
+            serial       = [string]$_.SerialNumber
+            bytes        = [int64]$_.Capacity
+            speed_mhz    = [int]$_.Speed
+        }
+    })
+} catch { $ramMods = @(); Out-Log "WMI PhysicalMemory failed: $($_.Exception.Message)" }
 $ramVendors = @($ramMods.manufacturer | Where-Object { $_ } | Sort-Object -Unique)
 $ramParts = @($ramMods.part | Where-Object { $_ } | Sort-Object -Unique)
 
-$gpus = @(Get-CimInstance Win32_VideoController | ForEach-Object {
-    [ordered]@{
-        name    = [string]$_.Name
-        driver  = [string]$_.DriverVersion
-        status  = [string]$_.Status
-        pnp     = [string]$_.PNPDeviceID
-    }
-})
+try {
+    $gpus = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {
+        [ordered]@{
+            name    = [string]$_.Name
+            driver  = [string]$_.DriverVersion
+            status  = [string]$_.Status
+            pnp     = [string]$_.PNPDeviceID
+        }
+    })
+} catch { $gpus = @(); Out-Log "WMI VideoController failed: $($_.Exception.Message)" }
 
-$disks = @(Get-PhysicalDisk | ForEach-Object {
-    [ordered]@{
-        friendly     = [string]$_.FriendlyName
-        media        = [string]$_.MediaType
-        health       = [string]$_.HealthStatus
-        bus          = [string]$_.BusType
-        size_bytes   = [int64]$_.Size
-        serial       = [string]$_.SerialNumber
-        firmware     = [string]$_.FirmwareVersion
-    }
-})
+try {
+    $disks = @(Get-PhysicalDisk -ErrorAction Stop | ForEach-Object {
+        [ordered]@{
+            friendly     = [string]$_.FriendlyName
+            media        = [string]$_.MediaType
+            health       = [string]$_.HealthStatus
+            bus          = [string]$_.BusType
+            size_bytes   = [int64]$_.Size
+            serial       = [string]$_.SerialNumber
+            firmware     = [string]$_.FirmwareVersion
+        }
+    })
+} catch { $disks = @(); Out-Log "Get-PhysicalDisk failed: $($_.Exception.Message)" }
 
 Set-Progress 5 'Reading SMART / reliability counters'
 $smart = @()
-Get-PhysicalDisk | ForEach-Object {
-    $pd = $_
+try { $physDisks = @(Get-PhysicalDisk -ErrorAction Stop) }
+catch { $physDisks = @(); Out-Log "Get-PhysicalDisk (SMART) failed: $($_.Exception.Message)" }
+foreach ($pd in $physDisks) {
     try {
         $c = Get-StorageReliabilityCounter -PhysicalDisk $pd -ErrorAction Stop
         $smart += [ordered]@{
@@ -367,15 +382,17 @@ Get-PhysicalDisk | ForEach-Object {
     }
 }
 
-$battery = @(Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | ForEach-Object {
-    [ordered]@{
-        name             = [string]$_.Name
-        status           = [string]$_.Status
-        estimated_pct    = $_.EstimatedChargeRemaining
-        design_capacity  = $_.DesignCapacity
-        full_charge      = $_.FullChargeCapacity
-    }
-})
+try {
+    $battery = @(Get-CimInstance Win32_Battery -ErrorAction Stop | ForEach-Object {
+        [ordered]@{
+            name             = [string]$_.Name
+            status           = [string]$_.Status
+            estimated_pct    = $_.EstimatedChargeRemaining
+            design_capacity  = $_.DesignCapacity
+            full_charge      = $_.FullChargeCapacity
+        }
+    })
+} catch { $battery = @(); Out-Log "WMI Battery failed: $($_.Exception.Message)" }
 
 Set-Progress 6 'Reading registry + copying hives'
 $customer = [ordered]@{ computer_name = $null; product_name = $null; current_build = $null; ubr = $null; install_date = $null }
@@ -409,12 +426,21 @@ if ($isLive) {
     Out-Log 'read live registry'
 
     # Live hives are locked - export with reg save (needs admin backup rights).
-    # HKLM\DEFAULT is not a mount point on a live system, so it is offline-only.
+    # DEFAULT mounts under HKU\.DEFAULT on a live box (HKLM\DEFAULT does not
+    # exist), so it gets its own source path.
     $hivesDir = Join-Path $OutDir 'hives'
     New-Item -ItemType Directory -Force -Path $hivesDir | Out-Null
-    foreach ($hive in 'SYSTEM', 'SOFTWARE', 'SAM', 'SECURITY') {
+    $liveHives = [ordered]@{
+        'SYSTEM'   = 'HKLM\SYSTEM'
+        'SOFTWARE' = 'HKLM\SOFTWARE'
+        'SAM'      = 'HKLM\SAM'
+        'SECURITY' = 'HKLM\SECURITY'
+        'DEFAULT'  = 'HKU\.DEFAULT'
+    }
+    foreach ($hive in $liveHives.Keys) {
         $dst = Join-Path $hivesDir $hive
-        $null = & reg.exe save "HKLM\$hive" "$dst" /y 2>&1
+        try { $null = & reg.exe save $liveHives[$hive] "$dst" /y 2>&1 }
+        catch { Out-Log "FAIL hive $hive :: $($_.Exception.Message)" }
         if (Test-Path $dst) { Out-Log "saved hive $hive" }
         else { Out-Log "FAIL hive $hive" }
         Pump-Ui
@@ -423,10 +449,11 @@ if ($isLive) {
     # Offline volume: mount read points with reg load, copy raw hive files.
     $sysHive = Join-Path $win 'Windows\System32\config\SYSTEM'
     $swHive = Join-Path $win 'Windows\System32\config\SOFTWARE'
-    $null = reg unload HKLM\OffSys 2>$null
-    $null = reg unload HKLM\OffSoft 2>$null
+    try { $null = reg unload HKLM\OffSys 2>$null } catch { }
+    try { $null = reg unload HKLM\OffSoft 2>$null } catch { }
     if (Test-Path $sysHive) {
-        $null = reg load HKLM\OffSys $sysHive 2>&1
+        try { $null = reg load HKLM\OffSys $sysHive 2>&1 }
+        catch { Out-Log "reg load SYSTEM failed: $($_.Exception.Message)" }
         try {
             $customer.computer_name = (Get-ItemProperty -Path 'HKLM:\OffSys\ControlSet001\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue).ComputerName
             $cc = Get-ItemProperty -Path 'HKLM:\OffSys\ControlSet001\Control\CrashControl' -ErrorAction SilentlyContinue
@@ -441,10 +468,11 @@ if ($isLive) {
                 }
             }
             Out-Log 'loaded SYSTEM hive'
-        } finally { $null = reg unload HKLM\OffSys 2>$null }
+        } finally { try { $null = reg unload HKLM\OffSys 2>$null } catch { } }
     }
     if (Test-Path $swHive) {
-        $null = reg load HKLM\OffSoft $swHive 2>&1
+        try { $null = reg load HKLM\OffSoft $swHive 2>&1 }
+        catch { Out-Log "reg load SOFTWARE failed: $($_.Exception.Message)" }
         try {
             $cv = Get-ItemProperty -Path 'HKLM:\OffSoft\Microsoft\Windows NT\CurrentVersion' -ErrorAction SilentlyContinue
             if ($cv) {
@@ -458,7 +486,7 @@ if ($isLive) {
                 }
             }
             Out-Log 'loaded SOFTWARE hive'
-        } finally { $null = reg unload HKLM\OffSoft 2>$null }
+        } finally { try { $null = reg unload HKLM\OffSoft 2>$null } catch { } }
     }
 
     # Copy the raw config hives (unlocked on an offline volume).

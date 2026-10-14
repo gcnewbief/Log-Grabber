@@ -5,7 +5,7 @@ a = Analysis(
     ['log_grabber.py'],
     pathex=[],
     binaries=[],
-    datas=[('collector.ps1', '.')],
+    datas=[('collector.ps1', '.'), ('icon.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['icon.ico'],
 )

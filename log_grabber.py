@@ -348,6 +348,9 @@ def main():
         return 1
 
     root = tk.Tk()
+    ico = bundle_dir() / "icon.ico"
+    if ico.exists():
+        root.iconbitmap(str(ico))
     LogGrabberApp(root)
     try:
         root.mainloop()

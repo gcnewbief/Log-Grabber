@@ -91,7 +91,8 @@ boot-drive verdict:
 Repo: github.com/gcnewbief/Log-Grabber · releases carry `LogGrabber.exe`.
 Version lives in `log_grabber.py __version__`; bump on behavior changes and
 re-tag (`v1.0.0` = initial release, `1.0.1` = storport internal/external
-split).
+split, `1.0.2` = fix build_findings crash on first real bugcheck —
+bad_checks dict had lost the (count, hex) tuples).
 
 ## Future work (next update)
 

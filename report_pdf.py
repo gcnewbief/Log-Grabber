@@ -141,7 +141,7 @@ def build_findings(diag):
     e6008 = _count(diag, "event_6008")
     disk_err = _count(diag, "disk_7_11_51_153")
     bug = _bugcheck_summary(diag)
-    bad_checks = {n: c for n, (c, _h) in bug.items() if n != "none (hard power / hang)"}
+    bad_checks = {n: v for n, v in bug.items() if n != "none (hard power / hang)"}
 
     bad_disk_names = []
     for d in (diag.get("storage") or {}).get("disks") or []:

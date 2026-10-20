@@ -119,10 +119,17 @@ bundles. Real disk-provider events name their target ("Disk N" /
 
 ## Storage health / SMART (events.storage_health)
 
-The **Storport/Health** channel (`...Storport%4Health.evtx`, copied by the
-collector) carries periodic per-device SMART snapshots — the best no-extra-
-tools source of real drive data (Get-StorageReliabilityCounter returns null
-for most NVMe fields):
+Three sources, merged by `_device_health(diag)`:
+
+1. **Direct NVMe health log** — the collector queries each NVMe drive via
+   `IOCTL_STORAGE_QUERY_PROPERTY` protocol-specific query (C# `NvmeQuery`,
+   Add-Type'd) for SMART log page 0x02 → `storage.smart[].nvme_log` hex.
+   This is the RELIABLE source: works on client Windows where the Health
+   channel is empty and reliability counters are null. A real drive's
+   composite temp is always nonzero — all-zero pages are treated as
+   unread (USB bridges respond with garbage).
+2. **Storport/Health** channel (`...Storage-Storport%4Health.evtx`) —
+   periodic SMART snapshots, but EMPTY on many client machines:
 
 - **512** = NVMe Health Information Log — `NvmeHealthLog` is the raw
   512-byte NVMe SMART page (hex string). `_decode_nvme_health` pulls
@@ -137,12 +144,19 @@ for most NVMe fields):
   surface (reported uncorrectable, temp, hw resets, CRC, endurance used).
 - 537–548 = "miniport logged a health event" — collected, counted, not
   decoded.
+3. **`MSStorageDriver_FailurePredictStatus`** (root\wmi) — ATA-only,
+   "Not supported" on pure-NVMe boxes. Where present it sets
+   `storage.smart[].predict_failure` (matched by serial in InstanceName) →
+   red "SMART predicts failure" finding + `** PREDICTS FAILURE **` in the
+   disk line.
 - Reliability-counter `read/write/flush_latency_max_ms` (ms — MS says >10s
   indicates a problem, `LATENCY_WARN_MS`) is now rendered in the SMART line
   and flagged "** SLOW **" + an orange finding — device-side corroboration
   for storport stalls.
-- `_storage_health(diag)` keeps the newest decoded blob per device serial;
-  `_match_health` joins it to `storage.smart` by serial then product.
+- `_device_health(diag)` merges Health-channel blobs and `nvme_log` decodes
+  keyed by serial; `_match_health` joins it to `storage.smart` by serial
+  then product. Each disk line in the PDF gets its own SMART sub-line
+  (or "not exposed by the storage API").
 
 ## Crash dump / WHEA decoding (report_pdf.py)
 
@@ -179,7 +193,10 @@ NVMe health decoding in the PDF, `1.0.4` = dump-header decoding +
 collection (bugcheck decoded from minidump/MEMORY.DMP headers, shown in the
 Crash dumps table and merged into BSOD findings), WHEA CPER section-type
 decoding, expanded + corrected bugcheck name maps, storage-class bugchecks
-now count toward the storage verdict).
+now count toward the storage verdict, `1.0.5` = storport indicator split
+into internal vs external/USB rows, direct NVMe SMART/Health log read via
+IOCTL_STORAGE_QUERY_PROPERTY (real wear/media-errors/spare/hours on client
+Windows), ATA FailurePredictStatus, SMART line always shown per disk).
 
 ## Future work (next update)
 

@@ -326,9 +326,12 @@ def _le128(b, off):
 
 
 def _decode_nvme_health(dd):
-    """Event 512 NvmeHealthLog = the standard NVMe SMART/Health page."""
+    """Event 512 NvmeHealthLog / collector nvme_log = the standard NVMe
+    SMART/Health page (512 bytes)."""
     raw = _hex_bytes(dd.get("NvmeHealthLog"))
-    if len(raw) < 192:
+    # composite temp is always a sane Kelvin value on a live drive - rejects
+    # all-zero pages and wrong-offset decodes of unrelated data
+    if len(raw) < 192 or not any(raw) or not (150 <= int.from_bytes(raw[1:3], "little") <= 500):
         return None
     return {
         "critical_warning": raw[0],
@@ -414,6 +417,24 @@ def _storage_health(diag):
             dec = _decode_ata_devstats(dd)
             if dec:
                 ent["ata"] = dec
+    return devs
+
+
+def _device_health(diag):
+    """Merged per-device decoded health: Storport/Health channel events plus
+    NVMe logs the collector read directly off the drive (smart[].nvme_log).
+    The channel is empty on most client machines - nvme_log is the reliable
+    source there."""
+    devs = _storage_health(diag)
+    for s in (diag.get("storage") or {}).get("smart") or []:
+        dec = _decode_nvme_health({"NvmeHealthLog": s.get("nvme_log")})
+        if not dec:
+            continue
+        key = (s.get("serial") or "").strip() or (s.get("friendly") or "?")
+        ent = devs.setdefault(key, {"product": s.get("friendly") or key,
+                                    "health_events": 0})
+        if "nvme" not in ent:
+            ent["nvme"] = dec
     return devs
 
 
@@ -620,8 +641,9 @@ def build_findings(diag):
                           "REPORT LUNS) with ILLEGAL REQUEST or no-device status in ~1ms - "
                           "normal chatter on every machine." + extra)))
 
-    # 1b. SMART / health-channel evidence - decoded device counters.
-    for key, h in _storage_health(diag).items():
+    # 1b. SMART / health evidence - decoded device counters (Health channel
+    # blobs + per-drive NVMe health logs collected directly off the device).
+    for key, h in _device_health(diag).items():
         name = h.get("product") or key
         nvme = h.get("nvme")
         if nvme:
@@ -655,6 +677,9 @@ def build_findings(diag):
                              f"{ge} uncorrectable IO errors in the device statistics log."))
 
     for s in (diag.get("storage") or {}).get("smart") or []:
+        if s.get("predict_failure"):
+            findings.append(("red", f"SMART predicts failure on {s.get('friendly', '?')}",
+                             "drive firmware reports an imminent failure (ATA SMART prediction) - back up and replace."))
         lat = _smart_latency_ms(s)
         if lat >= LATENCY_WARN_MS:
             findings.append(("orange", f"Very slow IO recorded on {s.get('friendly', '?')}",
@@ -756,17 +781,28 @@ def build_indicators(diag):
     stor = _count(diag, "storport_549_557")
     sp = _storport_classify(diag)
     sig_int = _merge_counts(sp["stall"]["internal"], sp["error"]["internal"])
-    n_sig_int = sum(sig_int.values())
-    n_sig_ext = sum(sp["stall"]["external"].values()) + sum(sp["error"]["external"].values())
-    n_sleep = _storport_total(sp["queued"])
-    n_noise = _storport_total(sp["benign"]) + _storport_total(sp["inconclusive"])
-    sp_note = (f"{n_sig_int} real internal ({_top_devices(sig_int, 2)})"
-               + (f"; {n_sig_ext} external/USB" if n_sig_ext else "")
-               + f"; {n_sleep} sleep/queue-wait; {n_noise} benign/unclear"
-               if stor else ">5s device I/O or command errors beat SMART Healthy - suspect SSD/NVMe")
-    rows.append(("Storport errors/slow IO", stor, sp_note,
+    sig_ext = _merge_counts(sp["stall"]["external"], sp["error"]["external"])
+    n_sig_int, n_sig_ext = sum(sig_int.values()), sum(sig_ext.values())
+    n_sleep_int = sum(sp["queued"]["internal"].values())
+    n_sleep_ext = sum(sp["queued"]["external"].values())
+    n_incon_int = sum(sp["inconclusive"]["internal"].values())
+    n_noise_int = sum(sp["benign"]["internal"].values()) + n_incon_int
+    n_noise_ext = sum(sp["benign"]["external"].values()) + sum(sp["inconclusive"]["external"].values())
+    n_int = n_sig_int + n_sleep_int + n_noise_int
+    n_ext = n_sig_ext + n_sleep_ext + n_noise_ext
+    int_note = (f"{n_sig_int} real stalls/errors ({_top_devices(sig_int, 2)}); "
+                f"{n_sleep_int} sleep/queue-wait; {n_noise_int} benign/unclear"
+                if n_int else "none recorded")
+    if not stor:
+        int_note = ">5s device I/O or command errors beat SMART Healthy - suspect SSD/NVMe"
+    rows.append(("Storport - internal / boot drive", n_int, int_note,
                  "red" if n_sig_int >= 3 else "orange"
-                 if n_sig_int or sum(sp["inconclusive"]["internal"].values()) >= 3 else "green"))
+                 if n_sig_int or n_incon_int >= 3 else "green"))
+    rows.append(("Storport - external / USB devices", n_ext,
+                 (f"{n_sig_ext} real stalls/errors ({_top_devices(sig_ext, 2)}); "
+                  f"{n_sleep_ext} sleep/queue-wait; {n_noise_ext} benign"
+                  if n_ext else "none recorded"),
+                 "orange" if n_sig_ext else "green"))
     whea_secs = _whea_section_counts(diag)
     whea_kinds = "/".join(sorted(whea_secs)) or "PCIe/RAM/CPU"
     rows.append(("WHEA hardware errors", _count(diag, "whea_errors"),
@@ -846,28 +882,46 @@ def generate_pdf(diag: dict, out_path, version: str = "1.0.0"):
 
     # --- machine summary ---
     story.append(Paragraph("Machine", st["h2"]))
+    def _smart_for(d):
+        """Match a storage.smart entry to a storage.disks entry (same
+        Get-PhysicalDisk source -> serial, else friendly name)."""
+        for s in smart:
+            if (s.get("serial") or "") and s.get("serial") == d.get("serial"):
+                return s
+            if (s.get("friendly") or "") and s.get("friendly") == d.get("friendly"):
+                return s
+        return None
+
     disk_lines = []
+    health_map = _device_health(diag)
     for d in disks:
-        bad = any(sku.lower() in (d.get("friendly") or "").lower() for sku in KNOWN_BAD_DISKS)
-        line = f"{d.get('friendly', '?')} ({d.get('media', '?')}, {d.get('bus', '?')}, {_gb(d.get('size_bytes'))}, health: {d.get('health', '?')})"
+        friendly = d.get("friendly", "?")
+        bad = any(sku.lower() in (friendly or "").lower() for sku in KNOWN_BAD_DISKS)
+        line = f"{friendly} ({d.get('media', '?')}, {d.get('bus', '?')}, {_gb(d.get('size_bytes'))}, health: {d.get('health', '?')})"
         if bad:
             line += "  ** KNOWN-BAD SKU **"
         disk_lines.append(line)
-    health_map = _storage_health(diag)
-    for s in smart:
-        if s.get("error"):
-            disk_lines.append(f"  SMART {s.get('friendly', '?')}: unreadable ({s.get('error', '?')})")
+        s = _smart_for(d)
+        if s is None:
+            disk_lines.append(f"  SMART {friendly}: not exposed by the storage API")
             continue
+        if s.get("error"):
+            disk_lines.append(f"  SMART {friendly}: unreadable ({s.get('error', '?')})")
+            continue
+        def _sv(v):
+            return str(v) if v is not None else "?"
         parts = [
-            f"wear {s.get('wear', '?')}%",
-            f"{s.get('power_on_hours', '?')}h on",
-            f"{s.get('temperature', '?')}C",
-            f"uncorr. r/w {s.get('read_errors_uncorrected', '?')}/{s.get('write_errors_uncorrected', '?')}".replace("None", "?"),
+            f"wear {_sv(s.get('wear'))}%",
+            f"{_sv(s.get('power_on_hours'))}h on",
+            f"{_sv(s.get('temperature'))}C",
+            f"uncorr. r/w {_sv(s.get('read_errors_uncorrected'))}/{_sv(s.get('write_errors_uncorrected'))}",
         ]
         lat = _smart_latency_ms(s)
         if lat:
             parts.append(f"max IO {lat}ms" + (" ** SLOW **" if lat >= LATENCY_WARN_MS else ""))
-        disk_lines.append(f"  SMART {s.get('friendly', '?')}: " + ", ".join(parts))
+        if s.get("predict_failure"):
+            parts.append("** PREDICTS FAILURE **")
+        disk_lines.append(f"  SMART {friendly}: " + ", ".join(parts))
         h = _match_health(s.get("serial"), s.get("friendly"), health_map)
         if not h:
             continue

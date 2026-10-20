@@ -358,12 +358,72 @@ try {
 } catch { $disks = @(); Out-Log "Get-PhysicalDisk failed: $($_.Exception.Message)" }
 
 Set-Progress 5 'Reading SMART / reliability counters'
+
+# NVMe SMART/Health log (page 0x02) via IOCTL_STORAGE_QUERY_PROPERTY
+# protocol-specific query - the same mechanism smartmontools uses. Works on
+# client Windows where reliability-counter fields are null and the
+# Storport/Health channel has no events. Returns the raw 512-byte log.
+$nvmeQueryOk = $false
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NvmeQuery {
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes,
+        IntPtr hTemplateFile);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool DeviceIoControl(IntPtr hDevice, uint dwIoControlCode,
+        byte[] lpInBuffer, uint nInBufferSize, byte[] lpOutBuffer, uint nOutBufferSize,
+        out uint lpBytesReturned, IntPtr lpOverlapped);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+
+    public static byte[] HealthLog(int driveNumber) {
+        IntPtr h = CreateFileW("\\\\.\\PhysicalDrive" + driveNumber,
+            0x80000000u /* GENERIC_READ */, 3u /* SHARE_READ|WRITE */,
+            IntPtr.Zero, 3u /* OPEN_EXISTING */, 0u, IntPtr.Zero);
+        if (h == new IntPtr(-1)) return null;
+        try {
+            // STORAGE_PROPERTY_QUERY(8) + STORAGE_PROTOCOL_SPECIFIC_DATA(40)
+            byte[] inp = new byte[48];
+            BitConverter.GetBytes(49).CopyTo(inp, 0);   // StorageAdapterProtocolSpecificProperty
+            BitConverter.GetBytes(0).CopyTo(inp, 4);    // PropertyStandardQuery
+            BitConverter.GetBytes(3).CopyTo(inp, 8);    // ProtocolType = Nvme
+            BitConverter.GetBytes(2).CopyTo(inp, 12);   // DataType = NVMeDataTypeLogPage
+            BitConverter.GetBytes(2).CopyTo(inp, 16);   // RequestValue = log page 2 (SMART/health)
+            BitConverter.GetBytes(40).CopyTo(inp, 24);  // ProtocolDataOffset
+            BitConverter.GetBytes(512).CopyTo(inp, 28); // ProtocolDataLength
+            byte[] outp = new byte[48 + 512];
+            uint ret;
+            if (!DeviceIoControl(h, 0x2D1400u /* IOCTL_STORAGE_QUERY_PROPERTY */,
+                                 inp, 48, outp, (uint)outp.Length, out ret, IntPtr.Zero)) return null;
+            if (BitConverter.ToInt32(outp, 28) < 512) return null; // ProtocolDataLength too short
+            byte[] log = new byte[512];
+            Array.Copy(outp, 48, log, 0, 512);
+            return log;
+        } finally { CloseHandle(h); }
+    }
+}
+'@
+    $nvmeQueryOk = $true
+} catch { Out-Log "Add-Type NvmeQuery failed: $($_.Exception.Message)" }
+
 $smart = @()
 try { $physDisks = @(Get-PhysicalDisk -ErrorAction Stop) }
 catch { $physDisks = @(); Out-Log "Get-PhysicalDisk (SMART) failed: $($_.Exception.Message)" }
 foreach ($pd in $physDisks) {
     try {
         $c = Get-StorageReliabilityCounter -PhysicalDisk $pd -ErrorAction Stop
+        $nvmeLog = $null
+        if ($nvmeQueryOk -and [string]$pd.BusType -eq 'NVMe' -and $null -ne $pd.DeviceId) {
+            try {
+                $log = [NvmeQuery]::HealthLog([int]$pd.DeviceId)
+                if ($log -and (@($log | Where-Object { $_ -ne 0 })).Count -gt 0) {
+                    $nvmeLog = -join ($log | ForEach-Object { $_.ToString('x2') })
+                }
+            } catch { Out-Log "NVMe health query drive $($pd.DeviceId): $($_.Exception.Message)" }
+        }
         $smart += [ordered]@{
             friendly                 = [string]$pd.FriendlyName
             serial                   = [string]$pd.SerialNumber
@@ -378,11 +438,26 @@ foreach ($pd in $physDisks) {
             read_latency_max_ms      = $c.ReadLatencyMax
             write_latency_max_ms     = $c.WriteLatencyMax
             flush_latency_max_ms     = $c.FlushLatencyMax
+            nvme_log                 = $nvmeLog
         }
     } catch {
         $smart += [ordered]@{ friendly = [string]$pd.FriendlyName; serial = [string]$pd.SerialNumber; error = $_.Exception.Message }
     }
 }
+
+# ATA SMART failure prediction - only present where the storage stack
+# exposes it (SATA drives behind atapi/storahci; absent on pure-NVMe boxes).
+try {
+    foreach ($fp in @(Get-CimInstance -Namespace root/wmi -ClassName MSStorageDriver_FailurePredictStatus -ErrorAction Stop)) {
+        $inst = [string]$fp.InstanceName
+        foreach ($s in $smart) {
+            $ser = ([string]$s.serial -replace '[_\.]', '')
+            if ($ser.Length -gt 4 -and $inst -like "*$ser*") {
+                $s.predict_failure = [bool]$fp.PredictFailure
+            }
+        }
+    }
+} catch { }
 
 try {
     $battery = @(Get-CimInstance Win32_Battery -ErrorAction Stop | ForEach-Object {

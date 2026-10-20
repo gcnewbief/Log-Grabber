@@ -242,6 +242,7 @@ if ($isLive) {
         'Microsoft-Windows-Kernel-WHEA/Operational',
         'Microsoft-Windows-Kernel-Dump/Operational',
         'Microsoft-Windows-Storage-Storport/Operational',
+        'Microsoft-Windows-Storage-Storport/Health',
         'Microsoft-Windows-Ntfs/Operational',
         'Microsoft-Windows-CodeIntegrity/Operational',
         'Microsoft-Windows-Kernel-PnP/Configuration',
@@ -270,6 +271,7 @@ if ($isLive) {
         'Microsoft-Windows-Kernel-WHEA%4Operational.evtx',
         'Microsoft-Windows-Kernel-Dump%4Operational.evtx',
         'Microsoft-Windows-Storage-Storport%4Operational.evtx',
+        'Microsoft-Windows-Storage-Storport%4Health.evtx',
         'Microsoft-Windows-Ntfs%4Operational.evtx',
         'Microsoft-Windows-CodeIntegrity%4Operational.evtx',
         'Microsoft-Windows-Kernel-PnP%4Configuration.evtx',
@@ -506,6 +508,7 @@ if ($isLive) {
 $sys = Join-Path $evtxDir 'System.evtx'
 $app = Join-Path $evtxDir 'Application.evtx'
 $stor = Join-Path $evtxDir 'Microsoft-Windows-Storage-Storport%4Operational.evtx'
+$storHealth = Join-Path $evtxDir 'Microsoft-Windows-Storage-Storport%4Health.evtx'
 $wheaE = Join-Path $evtxDir 'Microsoft-Windows-Kernel-WHEA%4Errors.evtx'
 $therm = Join-Path $evtxDir 'Microsoft-Windows-Kernel-Power%4Thermal-Operational.evtx'
 $kdump = Join-Path $evtxDir 'Microsoft-Windows-Kernel-Dump%4Operational.evtx'
@@ -526,9 +529,12 @@ $ev86 = Collect-Events $sys '*[System[(EventID=86)]]' 50
 $ev109 = Collect-Events $sys '*[System[(EventID=109)]]' 40
 $ev37 = Collect-Events $sys '*[System[(EventID=37) and Provider[@Name="Microsoft-Windows-Kernel-Processor-Power"]]]' 40
 Set-Progress 9 'Decoding storage / Storport / NTFS'
-$evDisk = Collect-Events $sys '*[System[(EventID=7 or EventID=11 or EventID=51 or EventID=153)]]' 40
+$evDisk = Collect-Events $sys '*[System[(EventID=7 or EventID=11 or EventID=51 or EventID=153) and Provider[@Name="disk"]]]' 40
 $ev219 = Collect-Events $sys '*[System[(EventID=219)]]' 20
-$stor549 = Collect-Events $stor '*[System[(EventID=549 or EventID=557)]]' 80
+$stor549 = Collect-Events $stor '*[System[(EventID=500 or EventID=501 or EventID=549 or EventID=550 or EventID=557 or EventID=561)]]' 80
+# Storport/Health channel: periodic SMART snapshots - 510 SMART attributes,
+# 511 ATA device statistics, 512 NVMe health log, 537-548 miniport health.
+$storHealthEv = Collect-Events $storHealth '*' 60
 $ntfsEv = Collect-Events $ntfs '*[System[(Level=1 or Level=2 or Level=3)]]' 30
 Set-Progress 10 'Decoding WHEA, Code Integrity, Application, WU'
 $whea = Collect-Events $wheaE '*' 40
@@ -544,16 +550,44 @@ $kbootEv = Collect-Events $kboot '*' 20
 $bugcheckNames = @{
     0 = 'none (hard power / hang)'
     10 = 'IRQL_NOT_LESS_OR_EQUAL'
+    25 = 'BAD_POOL_HEADER'
     26 = 'MEMORY_MANAGEMENT'
+    30 = 'KMODE_EXCEPTION_NOT_HANDLED'
+    36 = 'NTFS_FILE_SYSTEM'
+    59 = 'SYSTEM_SERVICE_EXCEPTION'
     80 = 'PAGE_FAULT_IN_NONPAGED_AREA'
-    116 = 'NMI_HARDWARE_FAILURE'
-    124 = 'BUGCODE_USB_DRIVER'
+    116 = 'BAD_SYSTEM_CONFIG_INFO'
+    119 = 'KERNEL_STACK_INPAGE_ERROR'
+    122 = 'KERNEL_DATA_INPAGE_ERROR'
+    123 = 'INACCESSIBLE_BOOT_DEVICE'
     127 = 'UNEXPECTED_KERNEL_MODE_TRAP'
+    128 = 'NMI_HARDWARE_FAILURE'
     133 = 'SETUP_FAILURE'
+    156 = 'MACHINE_CHECK_EXCEPTION'
+    159 = 'DRIVER_POWER_STATE_FAILURE'
+    190 = 'ATTEMPTED_WRITE_TO_READONLY_MEMORY'
+    194 = 'BAD_POOL_CALLER'
+    197 = 'DRIVER_CORRUPTED_EXPOOL'
+    209 = 'DRIVER_IRQL_NOT_LESS_OR_EQUAL'
+    222 = 'POOL_CORRUPTION_IN_FILE_AREA'
+    237 = 'UNMOUNTABLE_BOOT_VOLUME'
     239 = 'CRITICAL_PROCESS_DIED'
-    259 = 'CLOCK_WATCHDOG_TIMEOUT'
-    287 = 'DPC_WATCHDOG_TIMEOUT'
+    244 = 'CRITICAL_OBJECT_TERMINATION'
+    252 = 'ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY'
+    254 = 'BUGCODE_USB_DRIVER'
+    257 = 'CLOCK_WATCHDOG_TIMEOUT'
+    269 = 'WDF_VIOLATION'
+    270 = 'VIDEO_MEMORY_MANAGEMENT_INTERNAL'
+    278 = 'VIDEO_TDR_FAILURE'
+    279 = 'VIDEO_TDR_TIMEOUT_DETECTED'
+    292 = 'WHEA_UNCORRECTABLE_ERROR'
+    307 = 'DPC_WATCHDOG_TIMEOUT'
+    313 = 'KERNEL_SECURITY_CHECK_FAILURE'
+    314 = 'KERNEL_MODE_HEAP_CORRUPTION'
+    324 = 'BUGCODE_USB3_DRIVER'
+    340 = 'UNEXPECTED_STORE_EXCEPTION'
     351 = 'LOST_DELAYED_WRITE_TIMEOUT'
+    455 = 'STORE_DATA_STRUCTURE_CORRUPTION'
 }
 foreach ($s in $ev41.samples) {
     $code = 0
@@ -607,6 +641,21 @@ if (Test-Path $cbs) {
 
 # Ship the actual .dmp files - the only shot at them. Cap at the 10 most
 # recent; MEMORY.DMP stays excluded (can be GBs) but its size is recorded.
+# Every dump's first 8KB (the DUMP_HEADER: bugcheck code + parameters) is
+# captured as hex so the report can read the crash even when the file is
+# not copied or is later unavailable.
+function Read-FileHeadHex([string]$path, [int]$n = 8192) {
+    try {
+        $fs = [System.IO.File]::OpenRead($path)
+        $buf = New-Object byte[] $n
+        $got = $fs.Read($buf, 0, $n)
+        $fs.Close()
+        if ($got -gt 0) { return -join ($buf[0..($got - 1)] | ForEach-Object { $_.ToString('x2') }) }
+    } catch {
+        Out-Log "FAIL dump header read $path :: $($_.Exception.Message)"
+    }
+    return $null
+}
 $mdir = Join-Path $win 'Windows\Minidump'
 $mdumpOut = Join-Path $OutDir 'minidumps'
 $memDmp = Get-Item (Join-Path $win 'Windows\MEMORY.DMP') -ErrorAction SilentlyContinue
@@ -614,15 +663,17 @@ $dumps = [ordered]@{
     minidump_dir_exists = [bool](Test-Path $mdir)
     memory_dmp_exists   = [bool]$memDmp
     memory_dmp_bytes    = if ($memDmp) { [int64]$memDmp.Length } else { $null }
+    memory_dmp_header   = if ($memDmp) { Read-FileHeadHex $memDmp.FullName } else { $null }
     minidumps           = @()
 }
 if (Test-Path $mdir) {
     New-Item -ItemType Directory -Force -Path $mdumpOut | Out-Null
     $dumps.minidumps = @(Get-ChildItem $mdir -Filter '*.dmp' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending | Select-Object -First 10 | ForEach-Object {
+            $hdr = Read-FileHeadHex $_.FullName
             $copied = $false
             try { Copy-Item $_.FullName $mdumpOut -Force -ErrorAction Stop; $copied = $true } catch { }
-            [ordered]@{ name = $_.Name; bytes = $_.Length; mtime = $_.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss'); copied = $copied }
+            [ordered]@{ name = $_.Name; bytes = $_.Length; mtime = $_.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss'); copied = $copied; header = $hdr }
         })
     $copiedCount = @($dumps.minidumps | Where-Object { $_.copied }).Count
     Out-Log "minidumps: $($dumps.minidumps.Count) found, $copiedCount copied"
@@ -684,6 +735,7 @@ $diag = [ordered]@{
         processor_power_37       = Count-Of $ev37
         disk_7_11_51_153         = Count-Of $evDisk
         storport_549_557         = Count-Of $stor549
+        storport_health          = Count-Of $storHealthEv
         whea_errors              = Count-Of $whea
         code_integrity           = Count-Of $ciEv
         ntfs_warn_error          = Count-Of $ntfsEv
@@ -704,6 +756,7 @@ $diag = [ordered]@{
         disk                = $evDisk
         driver_219          = $ev219
         storport            = $stor549
+        storage_health      = $storHealthEv
         whea_errors         = $whea
         thermal_operational = $thermalOp
         kernel_dump         = $kdumpEv

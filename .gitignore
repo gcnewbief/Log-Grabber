@@ -11,6 +11,7 @@ cases/
 test_run/
 test_out/
 fault/
+Potential False Positives/
 *.zip
 *.evtx
 *.dmp
